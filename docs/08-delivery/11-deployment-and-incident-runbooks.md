@@ -901,3 +901,150 @@ item.
   cancellation needs a live provider API and **has not been done**.
 - **Rate limiting is per-process** (§9.8): it resets on restart and is not shared between instances.
 - **Vector retrieval is an interface only** — no embedder exists (ADR-0045).
+
+## 13. Alert response
+
+One section per alert in `ops/alerts.json`. Every rule links here, and
+`tools/validate-ops-templates.test.ts` fails if a link lands on a heading that does not exist — a runbook
+link an operator follows at 3am and learns nothing from is worse than no link.
+
+**These alerts are not deployed.** No monitoring system observes them. Each section below is the response
+*procedure*; the thresholds are starting values for an environment that does not exist yet.
+
+### API availability
+
+More than 5% of `/v1` requests are failing. Read `/ready` first: if a dependency check is unhappy, follow
+that check's section instead — availability is the symptom. Otherwise read the structured logs for the
+failing route pattern (never the resolved path; it carries tenant ids). Roll back the most recent deploy
+before debugging if the onset correlates with it.
+
+### Readiness
+
+A readiness check is failing, so this instance should not take traffic and, if the platform honours the
+probe, is not receiving any. `/ready` names the failing check. Fail closed is deliberate: a degraded
+optional dependency should show as `degraded` while a required one refuses readiness outright.
+
+### Migration mismatch
+
+Schema state does not match this build. **Do not "fix" this by running migrations against a database a
+newer build depends on.** Determine which direction the drift runs: a database behind this build needs the
+migration job; a database ahead of it means this build is stale and must be rolled forward, not the schema
+back. Migrations are forward-only (§2.2), and this alert fires at `for: 0m` because waiting cannot make it
+safer.
+
+### Unsafe role
+
+The application role is not the expected least-privilege role, or has acquired attributes it must not have
+(§2.1, ADR-0050). Treat as a potential isolation failure: tenant separation depends on RLS applying to this
+role, and `BYPASSRLS` silently removes it. Stop serving traffic from the affected instance before
+investigating.
+
+### Queue delay
+
+Work is accumulating faster than the workers drain it. Check whether the workers are alive, whether they
+are blocked on shared rate admission or budget (those have their own alerts and inhibit this one), and
+whether a poison work item is being retried indefinitely.
+
+### Provider failures
+
+A provider is failing a large share of attempts. Confirm from the attempt provenance whether the failures
+are retryable (transport, throttling, provider-side) or non-retryable (rejected request, auth, content
+refusal). Only the first class authorizes fallback; a non-retryable failure rerouted to a second paid model
+multiplies spend with no prospect of a different answer.
+
+### Retries
+
+Retries are well above baseline, which means spend is rising without more output. Correlate with provider
+failures. Sustained retry with no accompanying provider-failure alert suggests a request-shape problem
+rather than a provider problem.
+
+### Fallback
+
+Calls are being rerouted to secondary models, so cost per chapter is rising and prose is coming from a
+model the style contracts were not primarily tuned against. Check the primary route's health before raising
+limits.
+
+### Rate rejection
+
+The shared limiter is refusing a large share of calls. This is the limiter working, not failing. Decide
+deliberately whether the policy is too tight or the offered load too high; raising a shared limit affects
+every tenant that shares it.
+
+### Rate wait
+
+Callers are queuing behind the shared rate limit. Bounded by construction (`maxWaitMs`), so this is a
+throughput signal, not a hang.
+
+### Concurrency
+
+Shared concurrency is exhausted and work is waiting on leases. Look for leases held by dead processes: they
+expire by deadline rather than being lost, so a spike of expirations alongside this alert points at workers
+dying mid-call.
+
+### Budget rejection
+
+Work is being refused for budget, so production has stopped for that scope. This is the control doing its
+job. Raising a limit is a spend decision and belongs to the product owner, not to an on-call responder.
+
+### Unknown billing
+
+Calls are settling with unknown cost, so the recorded spend figure understates reality. This is truthful by
+construction (ADR-0049): an unknown cost keeps its reservation estimate and is never booked as zero.
+Reconcile against a provider invoice when one exists — which is external work.
+
+### Cancellation delay
+
+Cancellations are not reaching running calls promptly, which means paid work continues after a stop. Note
+what cancellation does and does not prove: it aborts the local request and prevents any further attempt,
+repair or fallback; whether the provider stopped generating is recorded as `unknown` unless a real provider
+acknowledges it.
+
+### Late responses
+
+Providers are answering after cancellation. The results are discarded and never reach canon, so this is an
+informational signal about provider behaviour rather than a fault.
+
+### Stale worker
+
+Workers are being fenced out, so a partitioned or slow worker is attempting stale writes. The fence is
+refusing them atomically with the write it protects (ADR-0048); investigate why the worker believes it
+still holds the lease.
+
+### Lease loss
+
+Workers are losing target leases mid-work. Correlate with pauses, restarts and database latency.
+
+### Pool saturation
+
+A database pool is running out of connections. Check for a query holding a connection far longer than
+expected before raising pool size; a larger pool against a saturated database makes things worse.
+
+### Embedding failure
+
+Embedding generation is failing. A set with failed items **cannot be activated** (migration 0016), so the
+current active set stays in place and retrieval continues on it — the failure delays a new set rather than
+breaking retrieval.
+
+### Retrieval failure
+
+Retrieval is mostly returning nothing, so continuity checks are running blind. Check whether an active
+embedding set exists for the project, whether the query vector's dimension matches it, and whether the
+lexical index has been rebuilt. Retrieval degrades to lexical-only rather than failing, so "no active set"
+is a likely and recoverable cause.
+
+### Restore drill
+
+No restore drill has succeeded recently, so recovery is unverified. Run the local drill (§8.2.1). A local
+logical dump/restore is **not** a staging or production restore and not PITR.
+
+### Output language
+
+Manuscript roles are producing non-English output, which fails the project's governing invariant
+(ADR-0026). The gateway discards and regenerates once, then reroutes; sustained failures mean a prompt,
+identity block or model change has regressed and should be rolled back.
+
+### Evaluator regression
+
+Evaluators are rejecting far more than baseline. Compare prompt versions and the pinned Production Policy
+version before concluding that quality dropped. Evaluator thresholds are **uncalibrated** (ADR-0029): a
+change in rejection rate may mean the judges moved, not the prose.
