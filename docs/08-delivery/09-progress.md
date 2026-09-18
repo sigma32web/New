@@ -998,3 +998,78 @@ quality, and synthetic contrast sets are not a substitute for the bilingual revi
 | 2026-09-14 | Repair: `createManuscriptVersion` numbers versions across `manuscript_versions ∪ quarantine_versions` so a quarantined draft and its replacement never share a `version_no` (found while seeding the fixture; regression test in `canon.integration.test.ts`) | `packages/db/src/repo.ts` |
 | 2026-09-15 | Chapter-production repair: previous-chapter gate runs before any model spend or canon write (T17); Replay `activity:<id>` binding with prompt-hash priority (no live calls); canon identity stays global, failure-paths tests isolate per-test via DB reset (T19/T19b); T11 extract-variant fixture carries schema-valid plan-frame + future-dated items | ADR-0046, `packages/workflows`, `examples/fixture/ch01/replay.ch01.json` |
 | 2026-09-15 | CLI chapter surface over the production workflow (no parallel orchestration): `chapter:produce` runs/resumes `produceChapter` with replay-only routing and deterministic workflow ids, `chapter:status` reads the persisted job, `chapter:resume` re-runs the same workflow id explicitly, `export:accepted` exports accepted text only; nonzero exit on failure; T19b proves two live projects cannot share deterministic fixture UUIDs | `apps/cli`, `apps/cli/src/chapter.test.ts` |
+
+### Credential-free automated readiness — shared enforcement, retrieval and operational templates
+
+**Status: implemented for the scope below. This does NOT complete Phase 4, the MVP or production
+readiness.** Continuation branch `hoplite/selinous-f82579f4` in the writable fork `sigma32web/New`, imported at exactly
+`5768f79a8a6314805ef5330eb275b8ad91928ea5` from `sigma31web/New:hoplite/akragas-7c1f75a8` with its
+13-commit ancestry preserved (13 ahead, 0 behind the base `30cb62af6fed0ac685fe29d44cae0f471577aab1`;
+26 files, +5,306/−20). Markers: `--automated-readiness-handoff-5768f79` and
+`--automated-readiness-baseline-5768f79` at the imported SHA.
+
+**Baseline at the imported SHA reproduced exactly before any edit:** 76 test files, 1,168 tests, 0
+skipped; 40 restore invariants; 49 chaos scenarios; 120-chapter replay with final canon version 122; 100
+contrast sets × 5 variants × 4 dimensions = 2,000 evaluations, 700/700 agreement, 0 false positives, 0
+false negatives, threshold 0.60, calibration `uncalibrated`, corpus hash
+`sha256:4c9ef2225e0e72ada566401183c453b19b7383c29cfac1a5617958aaeadbb97b`. Dependency audit 0 blocking;
+`git diff --check` clean; no file changed during the baseline.
+
+**Shared enforcement is now active in the worker's production path.** The limiter and `SharedBudget`
+existed but nothing used them: the gateway the worker constructed held a `MemoryBudget`, whose `Map` of
+spend is not a budget once the worker runs twice. `PgProviderAdmission` adapts migration 0015's
+primitives, taking the releasable concurrency lease BEFORE the un-undoable window counter so a refusal
+unwinds exactly. The gateway admits **per attempt, inside the loop**, so retry, bounded repair and route
+fallback each earn their own admission for the model they will actually pay; a refusal is not a provider
+fault and is never rerouted or repaired. The worker defaults to shared enforcement, reaches
+`MemoryBudget` only through an explicit `YEONJAE_ENFORCEMENT_MODE=isolated_test`, fails closed on an
+unrecognized value, and asserts the 0015 functions exist before accepting work.
+
+**Multi-process tests now exist**, which required fixing the inherited shared-database reset race.
+`resetDatabase` drops the `public` and `canon` schemas, so two contexts on one database delete each
+other's tables; the fix is a database per context created from the same migrations, not sleeps or retries.
+Children are real OS processes reporting JSON state lines, so "the holder died" means it died, and the
+parent synchronises on printed state rather than elapsed time.
+
+**Retrieval.** A deterministic local embedder (hashed lexical features, fixed 256 dimensions, SHA-256
+bucketing, L2-normalized with rounded components). It captures lexical overlap, **not meaning**: fixture
+recall measured against it is evidence the pipeline works and says nothing about production embedding
+quality. Migration 0016 completes the embedding-set lifecycle 0003 left as a registry, with activation as
+a locked function rather than two UPDATEs, so a reader never observes two active sets or none, and an
+empty or incomplete set is refused. Migration 0017 adds the project-scoped thesaurus, where expansion is
+a retrieval aid and never a canon assertion. Hybrid ranking normalizes each side against its own best hit
+before weighting, with a total order so ties are deterministic, and degrades to lexical-only rather than
+failing.
+
+**Operational templates exist and are statically validated — never built, never run, never deployed.**
+No container runtime and no monitoring system are available here. 32 tests check the compose service
+graph, dependency conditions, published ports, credential defaults, Dockerfile stages, a secret scan, and
+every alert and dashboard metric and label against the observability registry.
+
+**Defects found and fixed in this tranche**
+
+| ID | Severity | Defect |
+| --- | --- | --- |
+| R-1 | HIGH | the metrics registry filtered labels with `isLoggableKey`, the LOG allowlist, which permits any `*_id` suffix — so a tenant identifier could become a metric label on the deliberately unauthenticated `/metrics` endpoint, an unbounded-cardinality and disclosure defect at once. Metric labels now use their own strict allowlist and values outside a bounded shape collapse to `other` |
+| R-2 | HIGH | the gateway recognized a budget refusal by CLASS (`GatewayError`), so a `SharedBudget` rejection — which raises `BudgetExhaustedError` from `@yeonjae/db` and cannot import that class without inverting the package dependency — produced **no `budget_blocked` audit row**. Now matched on `code` |
+| R-3 | MEDIUM | `canon.gc_eligible_embedding_sets` filtered the rollback target BEFORE computing recency, renumbering the remaining rows and hiding genuinely eligible sets behind the keep window |
+| R-4 | MEDIUM | the thesaurus normalized surfaces with `toNfcText`, which returns a `{ text, codePoints }` record rather than a string, corrupting every stored surface to `"[object Object]"` |
+| R-5 | LOW | the Dockerfile healthcheck probed `/readyz` against a server that serves `/ready`; every container would have reported unhealthy. Caught by the static validator written alongside it |
+| R-6 | LOW | alert runbook links pointed at sections that did not exist; 24 response sections were added and the validator now fails on a missing anchor |
+
+**Known flake, recorded rather than hidden.** `lease-fence.integration.test.ts` → "serializes a
+concurrent steal against an open fenced transaction" failed once in a combined
+`packages/db packages/prose packages/context` run and passed on every isolated and repeated run
+(3/3 isolated, 323/323 for `packages/db`, 403/403 on the combined retry). It is inherited, timing-sensitive
+and not caused by this tranche's changes; it does not block deterministic continuation and is **not**
+worked around by weakening the assertion.
+
+**Scope limits, stated rather than glossed.** The following are credential-free and **were not done** in
+this tranche; they remain listed in `12-remaining-external-work.md` under "Not blocked, and honestly
+still open": worker liveness/readiness endpoints and an explicit API drain phase; operator `/v1` and CLI
+surfaces for the new subsystems (the controls exist as tested library functions); **metric call sites** for
+the new counters (names, labels, cardinality guards and template validation exist, but the gateway, worker
+and retrieval paths do not yet increment them); the remaining deterministic workflow surfaces; local
+recovery completion beyond the current 40 invariants; credential-rotation simulation; bounded performance
+smoke tests; and the single end-to-end automated-readiness scenario. **Phase 4 remains incomplete**, no
+live provider call was made, and no real credential was used.

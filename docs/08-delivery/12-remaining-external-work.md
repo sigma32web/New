@@ -27,9 +27,9 @@ exist before the live tranche begins.
 | --- | --- | --- |
 | Staging and production deployment | no environment exists | readiness gates on migration state, schema drift and role attributes |
 | Staging/production restore and real PITR | needs a deployed database and WAL archive | local deterministic logical dump/restore with 40 invariants, including security metadata and re-executed post-restore behaviour |
-| Production monitoring observation | needs a running deployment scraping `/metrics` | per-process Prometheus registry with a label allowlist |
+| Production monitoring observation | needs a running deployment scraping `/metrics` | per-process Prometheus registry with a STRICT metric-label allowlist, plus `ops/alerts.json` and `ops/dashboards.json` validated against that registry. **Nothing observes them**; no alert has ever fired |
 | The privilege model verified on a deployed cluster | needs that cluster | ADR-0050's model asserted against local PostgreSQL 16 and in fork CI |
-| Container topology (Dockerfiles, Compose profiles) | **no container runtime is available in this workspace** — `docker` and `podman` are both absent, so anything written here would be unvalidated YAML | the processes already start from environment variables, refuse unsafe defaults, and expose health/readiness |
+| **Building and running** the container topology | **no container runtime is available in this workspace** — `docker` and `podman` are both absent | `deploy/Dockerfile`, `deploy/.dockerignore` and `deploy/compose.yaml` exist and are **statically validated** by 32 tests (stage graph, dependency conditions, published ports, credential defaults, health paths checked against real routes, secret scan). They have **never been built or run** |
 
 ## Blocked on a real secret manager
 
@@ -48,16 +48,30 @@ exist before the live tranche begins.
 ## Not blocked, and honestly still open
 
 Recorded here so the list above cannot be read as "everything else is done". These are credential-free and
-could be implemented next:
+could be implemented next. The previous entries for shared enforcement, local embeddings, versioned vector
+retrieval, the thesaurus, multi-process tests, metrics and deployment/alert templates have been **removed
+because they are now implemented** (see `09-progress.md`).
 
-- wiring `SharedBudget` and the shared rate limiter into the worker's production path (the ledger, the
-  limiter and their tests exist; the gateway still constructs `MemoryBudget` by default);
-- a local deterministic embedding provider and versioned vector retrieval (the interface and
-  `embedding_sets` lifecycle exist; the active-set switch and hybrid ranking do not);
-- a project-scoped name/terminology thesaurus;
-- multi-process integration tests, which additionally need the shared-database reset race fixed
-  (documented in `09-progress.md`: it is inherited, needs two vitest processes, and the repository's
-  single-process configuration does not hit it);
-- metrics for the new rate-limit and budget signals;
-- deployment manifests and alert-rule templates, which can be written and statically validated even
-  without a cluster.
+- **Health, readiness and graceful shutdown completion.** Readiness already fails closed on migration
+  state, schema drift and role attributes, and the worker now drains its Temporal connection and pool on
+  every exit path. Not done: a worker liveness/readiness endpoint of its own, an explicit API drain phase
+  with a bounded deadline, telemetry flush on shutdown, and a declared degraded-versus-unavailable
+  distinction for optional dependencies.
+- **Operator API and CLI surfaces for the new subsystems.** The controls exist as library functions with
+  tests (rate-limit status, budget status, embedding-set activation and rollback, retrieval diagnostics,
+  thesaurus expansion diagnostics), and the operator `/v1` and CLI surfaces that would expose them have
+  **not** been added.
+- **Metric call sites.** The metric names, help text, label allowlist and cardinality tests exist and are
+  validated against the alert and dashboard templates. The new counters are **not yet incremented from the
+  gateway, worker and retrieval paths**; only the pre-existing API metrics have live call sites.
+- **The remaining deterministic workflow surfaces** listed in `02-backlog.md` (batch operations,
+  regeneration preview, typography and platform-format checks, deterministic export preparation).
+- **Local recovery completion beyond the current 40 invariants:** a backup manifest with migration hashes
+  and checksums, injected-failure cases (truncated backup, checksum mismatch, missing migration,
+  interrupted restore), and a local-only WAL/PITR rehearsal harness.
+- **Credential-rotation simulation** with generated fake credentials: key identifiers, overlap windows,
+  retired-credential rejection, rollback, and a fake local secret-manager adapter.
+- **Bounded performance smoke tests** (concurrent API requests, shared admission and reservation
+  throughput, retrieval latency, N+1 and index checks).
+- **One full deterministic end-to-end automated-readiness scenario** wiring all of the above together in a
+  single run with a no-skip guard.
