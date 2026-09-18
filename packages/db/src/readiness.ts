@@ -21,6 +21,7 @@
  * dependency is down, or a transient provider outage would cause an orchestrator to kill healthy
  * processes and turn a degraded system into an outage.
  */
+import { METRIC, METRIC_HELP, type Metrics, safeLabelValue } from '@yeonjae/domain';
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -218,6 +219,38 @@ export interface ReadinessOptions {
     readonly { readonly name: string; readonly probe: () => Promise<boolean> }[] | undefined;
   /** Whether provider mode is required for this process. The API can read without one; a worker cannot. */
   readonly requireProviderMode?: boolean | undefined;
+  /** Where to record readiness failures, by BOUNDED check name. */
+  readonly metrics?: Metrics | undefined;
+}
+
+/**
+ * Record failures by check NAME, never by detail.
+ *
+ * The detail string is operator-facing prose that can name a migration file or a role attribute; as a
+ * metric label it would be unbounded cardinality. The check name is a closed set, so it is the label.
+ * `migration` and `app_role` failures additionally raise their own counters, because those two states
+ * mean "do not serve traffic" rather than "something is slow".
+ */
+function recordReadiness(metrics: Metrics | undefined, checks: readonly ReadinessCheck[]): void {
+  if (!metrics) return;
+  for (const check of checks) {
+    if (check.status !== 'fail') continue;
+    metrics.increment(METRIC.readinessFailures, METRIC_HELP[METRIC.readinessFailures] ?? '', {
+      check: safeLabelValue(check.name),
+    });
+    if (check.name === 'migrations') {
+      metrics.increment(METRIC.migrationMismatch, METRIC_HELP[METRIC.migrationMismatch] ?? '', {
+        reason: 'schema_state',
+      });
+    }
+    if (check.name === 'app_role') {
+      metrics.increment(
+        METRIC.roleAssumptionFailures,
+        METRIC_HELP[METRIC.roleAssumptionFailures] ?? '',
+        { reason: 'unsafe_role' },
+      );
+    }
+  }
 }
 
 /** Run every readiness check and summarise. Safe to expose: no credentials, no connection strings. */
@@ -233,11 +266,11 @@ export async function readiness(
   } catch {
     // A failed connection short-circuits: every later check would fail for the same reason, and the
     // detail must not echo the driver error.
-    return {
-      ready: false,
-      degraded: false,
-      checks: [{ name: 'database', status: 'fail', detail: 'the database is not reachable' }],
-    };
+    const failed: ReadinessCheck[] = [
+      { name: 'database', status: 'fail', detail: 'the database is not reachable' },
+    ];
+    recordReadiness(opts.metrics, failed);
+    return { ready: false, degraded: false, checks: failed };
   }
 
   const migrations = await checkMigrations(db, opts.migrationsDir);
@@ -261,6 +294,7 @@ export async function readiness(
     }
   }
 
+  recordReadiness(opts.metrics, checks);
   return {
     ready: !checks.some((c) => c.status === 'fail'),
     degraded: checks.some((c) => c.status === 'degraded'),

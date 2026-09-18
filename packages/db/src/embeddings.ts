@@ -10,6 +10,7 @@
  * sequential scan — correct and bounded, right for fixtures and development, and explicitly not a
  * production ANN index.
  */
+import { METRIC, METRIC_HELP, type Metrics, safeLabelValue } from '@yeonjae/domain';
 import { type Client, type Pool } from './client.js';
 
 type Queryable = Pool | Client;
@@ -110,6 +111,9 @@ export async function putEmbedding(
     searchDocumentId: string;
     embedding: readonly number[];
     contentHash: string;
+    /** Bounded backend label, e.g. the embedder's provider name. */
+    backend?: string | undefined;
+    metrics?: Metrics | undefined;
   },
 ): Promise<{ inserted: boolean }> {
   const r = await db.query<{ inserted: boolean }>(
@@ -132,6 +136,16 @@ export async function putEmbedding(
     ],
   );
   const inserted = r.rows[0]?.inserted ?? false;
+  input.metrics?.increment(
+    METRIC.embeddingsGenerated,
+    METRIC_HELP[METRIC.embeddingsGenerated] ?? '',
+    {
+      backend: safeLabelValue(input.backend ?? 'local_deterministic'),
+      // A resumed run UPDATES rather than inserts; counting them apart is what makes the counter
+      // usable for progress instead of merely for volume.
+      outcome: inserted ? 'inserted' : 'updated',
+    },
+  );
   // item_count is maintained here rather than by trigger so a resumed run does not inflate it.
   if (inserted) {
     await db.query('UPDATE embedding_sets SET item_count = item_count + 1 WHERE id = $1', [
@@ -146,11 +160,18 @@ export async function recordEmbeddingFailure(
   db: Queryable,
   setId: string,
   count = 1,
+  metrics?: Metrics,
 ): Promise<void> {
   await db.query('UPDATE embedding_sets SET failed_count = failed_count + $2 WHERE id = $1', [
     setId,
     count,
   ]);
+  metrics?.increment(
+    METRIC.embeddingsGenerated,
+    METRIC_HELP[METRIC.embeddingsGenerated] ?? '',
+    { backend: 'local_deterministic', outcome: 'failed' },
+    count,
+  );
 }
 
 export async function clearEmbeddingFailures(db: Queryable, setId: string): Promise<void> {
@@ -228,6 +249,7 @@ export async function rollbackEmbeddingSet(
   projectId: string,
   purpose: EmbeddingPurpose = 'retrieval',
   now: Date = new Date(),
+  metrics?: Metrics,
 ): Promise<EmbeddingSetRow> {
   const r = await db.query<EmbeddingSetRow>(
     'SELECT * FROM canon.rollback_embedding_set($1, $2, $3)',
@@ -235,6 +257,11 @@ export async function rollbackEmbeddingSet(
   );
   const row = r.rows[0];
   if (!row) throw new Error('rollback_embedding_set returned no row');
+  metrics?.increment(
+    METRIC.embeddingSetActivations,
+    METRIC_HELP[METRIC.embeddingSetActivations] ?? '',
+    { outcome: 'rolled_back' },
+  );
   return row;
 }
 

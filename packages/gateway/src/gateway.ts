@@ -6,7 +6,15 @@
  */
 import { createHash } from 'node:crypto';
 import { checkOutputLanguage, toNfcText } from '@yeonjae/prose';
-import { uuidv7, validatorFor, type Uuid } from '@yeonjae/domain';
+import {
+  METRIC,
+  METRIC_HELP,
+  type Metrics,
+  safeLabelValue,
+  uuidv7,
+  validatorFor,
+  type Uuid,
+} from '@yeonjae/domain';
 import {
   cancellationErrorOf,
   composeCancellation,
@@ -211,6 +219,13 @@ export interface GatewayOptions {
    * stay valid, but the worker's production path supplies it and refuses to start without it.
    */
   readonly admission?: ProviderAdmissionControl | undefined;
+  /**
+   * Where to record operational counters.
+   *
+   * Optional so every existing single-purpose test gateway stays valid, and passed in rather than
+   * module-global so a test can assert on exactly the emissions of the call it made.
+   */
+  readonly metrics?: Metrics | undefined;
   readonly guardContext?: GuardContext | undefined;
   /** Minimum English confidence for manuscript roles (policy.output_language.min_english_confidence). */
   readonly minEnglishConfidence?: number | undefined;
@@ -271,6 +286,34 @@ export function isBudgetExhausted(err: unknown): boolean {
 
 export class Gateway {
   constructor(private readonly opts: GatewayOptions) {}
+
+  /**
+   * Record one counter, with labels bounded at the call site.
+   *
+   * Every label value passes through `safeLabelValue`, so a value that is not a closed enum collapses
+   * to `other` rather than becoming a new time series. The registry enforces the same rule, but doing
+   * it here as well makes the intent visible where the label is chosen: nothing derived from a request,
+   * a tenant, a prompt or an exception message may become a label.
+   */
+  private count(name: string, labels: Readonly<Record<string, string>> = {}): void {
+    const metrics = this.opts.metrics;
+    if (!metrics) return;
+    const safe: Record<string, string> = {};
+    for (const [k, v] of Object.entries(labels)) safe[k] = safeLabelValue(v);
+    metrics.increment(name, METRIC_HELP[name] ?? '', safe);
+  }
+
+  private observe(
+    name: string,
+    seconds: number,
+    labels: Readonly<Record<string, string>> = {},
+  ): void {
+    const metrics = this.opts.metrics;
+    if (!metrics) return;
+    const safe: Record<string, string> = {};
+    for (const [k, v] of Object.entries(labels)) safe[k] = safeLabelValue(v);
+    metrics.observe(name, METRIC_HELP[name] ?? '', seconds, safe);
+  }
 
   private routesFor(cls: ModelClass, excludeFamily?: string): RouteEntry[] {
     const routes = [...this.opts.routing[cls]].sort((a, b) => a.priority - b.priority);
@@ -351,6 +394,17 @@ export class Gateway {
      */
     if (cancelled()) {
       const err = cancellationErrorOf(handle);
+      /**
+       * Cancelled BEFORE the budget reservation, so this path never reaches `settleCancelled`.
+       *
+       * It still has to emit, or the cheapest and most desirable cancellation -- the one that costs
+       * nothing because no provider was contacted -- would be the one the metrics never showed. There
+       * is no settlement counter here precisely because there was no reservation to settle.
+       */
+      this.count(METRIC.cancellationRequests, { source: err.reason });
+      this.count(METRIC.cancellationObservations, { phase: 'before_first_attempt' });
+      this.count(METRIC.remoteCancellation, { state: err.remoteCancellation });
+      this.count(METRIC.unknownCost, { scope_kind: 'job' });
       await this.opts.audit.append(
         this.cancelledRecord(req, guard, primary, params, {
           error: err,
@@ -388,6 +442,9 @@ export class Gateway {
          * record an operator needs to tell "refused by policy" from "crashed".
          */
         if (isBudgetExhausted(err)) {
+          this.count(METRIC.budgetReservations, { scope_kind: 'job', outcome: 'refused' });
+          // The same refusal the audit row records as `budget_blocked`, so metric and audit agree.
+          this.count(METRIC.budgetBlocks, { scope_kind: 'job' });
           await this.opts.audit.append(
             this.record(
               req,
@@ -409,6 +466,8 @@ export class Gateway {
         }
         throw err;
       });
+
+    this.count(METRIC.budgetReservations, { scope_kind: 'job', outcome: 'reserved' });
 
     let attempt = 0;
     let repairAttempts = 0;
@@ -451,6 +510,20 @@ export class Gateway {
       // Released at ACTUAL cost, never at the prediction: a cancelled call must not leave phantom spend
       // reserved against the project, and must not refund spend that genuinely happened.
       await reservation.release(actualCost);
+      this.count(METRIC.cancellationRequests, { source: cancelled.reason });
+      this.count(METRIC.cancellationObservations, {
+        phase: beforeFirstAttempt ? 'before_first_attempt' : 'in_flight',
+      });
+      // The getter, not the raw field: it defaults to `unknown` rather than to a claim.
+      this.count(METRIC.remoteCancellation, { state: cancelled.remoteCancellation });
+      // Truthful accounting: a cancelled call whose usage the provider never reported settles as
+      // UNKNOWN, never as a comfortable zero (ADR-0049). The counter says the same thing.
+      if (cancelled.detail.usage === undefined) {
+        this.count(METRIC.unknownCost, { scope_kind: 'job' });
+        this.count(METRIC.budgetSettlements, { scope_kind: 'job', outcome: 'unknown' });
+      } else {
+        this.count(METRIC.budgetSettlements, { scope_kind: 'job', outcome: 'known' });
+      }
       throw cancelled;
     };
 
@@ -493,6 +566,19 @@ export class Gateway {
             tokens: req.pack.tokenEstimate + params.max_tokens,
             signal: handle.signal,
           });
+          this.observe(METRIC.rateWaitSeconds, grant.waitedMs / 1000, {
+            operation_class: 'provider_call',
+          });
+          this.count(METRIC.rateAdmission, {
+            operation_class: 'provider_call',
+            reason: grant.reason,
+            outcome: grant.admitted ? 'admitted' : 'refused',
+          });
+          if (grant.admitted) {
+            this.count(METRIC.concurrencyAcquired, { provider: route.provider });
+          } else if (grant.reason === 'concurrency_exhausted') {
+            this.count(METRIC.concurrencySaturated, { provider: route.provider });
+          }
           if (!grant.admitted) {
             /**
              * Refused. This is not a provider fault, so it must not be rerouted to a second paid model
@@ -572,6 +658,10 @@ export class Gateway {
               // usage is preserved truthfully, because tokens the provider reported were really produced.
               // A late FAILURE must not overwrite the authoritative cancellation.
               responseDiscarded = true;
+              // A provider answered AFTER an authoritative cancellation. Counted where the discard
+              // actually happens, so the metric cannot disagree with the audit record.
+              this.count(METRIC.lateResponses, { outcome: outcome.ok ? 'success' : 'failure' });
+              this.count(METRIC.discardedArtifacts, { reason: 'late_response' });
               if (outcome.ok) discardedUsage = outcome.value.usage;
             },
           );
@@ -619,7 +709,16 @@ export class Gateway {
             usage: { input: 0, output: 0, cached: 0 },
             latency_ms: 0,
           });
+          this.count(METRIC.providerAttempts, {
+            provider: route.provider,
+            model_class: req.modelClass,
+            status: 'failed',
+          });
           if (!isRetryable(failureClass)) break;
+          // Only a retryable class reaches here, which is exactly when a further attempt is
+          // authorized -- so this is the honest place to count a retry and a route fallback.
+          this.count(METRIC.retries, { reason: failureClass });
+          this.count(METRIC.fallbacks, { reason: failureClass });
           fallbackFrom = route.modelId;
           routeIdx++;
           continue;
@@ -679,6 +778,7 @@ export class Gateway {
           }
           if (!schemaValid) {
             repairAttempts++;
+            this.count(METRIC.repairs, { reason: 'schema_invalid' });
             lastError = { class: 'SCHEMA_INVALID', message: 'structured output did not validate' };
             noteAttempt('failed', 'SCHEMA_INVALID');
             if (repairAttempts <= 2) continue; // bounded repair = regenerate on the same route
@@ -740,6 +840,12 @@ export class Gateway {
         );
         await this.opts.audit.append(record);
         await reservation.release(actualCost);
+        this.count(METRIC.providerAttempts, {
+          provider: route.provider,
+          model_class: req.modelClass,
+          status: 'succeeded',
+        });
+        this.count(METRIC.budgetSettlements, { scope_kind: 'job', outcome: 'known' });
         return this.fromAudit(record, false);
       }
       // exhausted

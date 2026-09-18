@@ -17,6 +17,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { Gateway, MemoryBudget, ReplayProvider, type RoutingTable } from '@yeonjae/gateway';
+import { Metrics } from '@yeonjae/domain';
 import { ArtifactLlmOutputStore, type ChapterProductionDeps } from '@yeonjae/workflows';
 import { PgAuditStore, PgProviderAdmission, SharedBudget, type Pool } from '@yeonjae/db';
 
@@ -116,7 +117,15 @@ export function replayRouting(): RoutingTable {
  */
 export function productionDeps(
   pool: Pool,
-  opts: { readonly enforcement?: EnforcementMode | undefined } = {},
+  opts: {
+    readonly enforcement?: EnforcementMode | undefined;
+    /**
+     * The process-wide registry. One instance per PROCESS, shared by every gateway this factory
+     * builds: a registry per project would reset its counters whenever a project's deps were rebuilt,
+     * which is the opposite of what a scraped counter is for.
+     */
+    readonly metrics?: Metrics | undefined;
+  } = {},
 ): (input: { workspaceId: string; projectId: string }) => ChapterProductionDeps {
   providerModeFromEnv();
   const enforcement = opts.enforcement ?? enforcementModeFromEnv();
@@ -127,6 +136,7 @@ export function productionDeps(
   const budgetCents = Number(process.env.YEONJAE_BUDGET_CENTS ?? '100000');
   const holder = `worker:${process.env.YEONJAE_WORKER_ID ?? String(process.pid)}`;
   const maxWaitMs = Number(process.env.YEONJAE_RATE_MAX_WAIT_MS ?? '0');
+  const metrics = opts.metrics ?? new Metrics();
 
   return ({ workspaceId, projectId }) => {
     const provider = new ReplayProvider(recording as never);
@@ -142,6 +152,7 @@ export function productionDeps(
           providers: new Map([['replay', provider]]),
           routing: replayRouting(),
           budget: new MemoryBudget(budgetCents),
+          metrics,
           audit,
         }),
       };
@@ -153,7 +164,8 @@ export function productionDeps(
         routing: replayRouting(),
         // The shared ledger, so two workers spending against one project see one another's spend.
         budget: new SharedBudget(pool),
-        admission: new PgProviderAdmission(pool, { holder, maxWaitMs }),
+        admission: new PgProviderAdmission(pool, { holder, maxWaitMs, metrics }),
+        metrics,
         audit,
       }),
     };

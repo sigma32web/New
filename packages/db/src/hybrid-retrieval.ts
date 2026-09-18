@@ -13,6 +13,7 @@
  * accepted-only filtering, active-set switching, weighting, tie-breaking — behaves correctly. It is not
  * evidence of production retrieval quality, which needs a real embedding provider.
  */
+import { METRIC, METRIC_HELP, type Metrics, safeLabelValue } from '@yeonjae/domain';
 import { activeEmbeddingSet, vectorSearch, type EmbeddingPurpose } from './embeddings.js';
 import { lexicalSearch, type SearchHit } from './retrieval.js';
 import { expandQuery, type Expansion } from './thesaurus.js';
@@ -73,6 +74,8 @@ export interface HybridQuery {
   readonly includeDisguises?: boolean | undefined;
   /** Bound the result payload, so an operator endpoint cannot return an unbounded body. */
   readonly maxChars?: number | undefined;
+  /** Where to record retrieval counters. Optional so unit callers need not supply one. */
+  readonly metrics?: Metrics | undefined;
 }
 
 export const DEFAULT_LIMIT = 20;
@@ -95,6 +98,8 @@ function normalized(values: readonly number[]): (v: number) => number {
  */
 export async function hybridSearch(db: Queryable, q: HybridQuery): Promise<HybridResult> {
   const notes: string[] = [];
+  // Monotonic: a wall-clock delta can go backwards across an NTP step and produce a negative latency.
+  const startedAt = process.hrtime.bigint();
   const limit = Math.min(q.limit ?? DEFAULT_LIMIT, MAX_LIMIT);
   const weights = {
     lexical: q.weights?.lexical ?? DEFAULT_WEIGHTS.lexical,
@@ -225,6 +230,37 @@ export async function hybridSearch(db: Queryable, q: HybridQuery): Promise<Hybri
     hits.push(hit);
   }
   if (fused.length > limit) truncated = true;
+
+  if (q.metrics) {
+    const seconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
+    const label = { mode: safeLabelValue(mode) };
+    q.metrics.observe(
+      METRIC.retrievalLatency,
+      METRIC_HELP[METRIC.retrievalLatency] ?? '',
+      seconds,
+      label,
+    );
+    // The COUNT of results, not the results: a result count cannot reconstruct prose.
+    q.metrics.increment(
+      METRIC.retrievalResults,
+      METRIC_HELP[METRIC.retrievalResults] ?? '',
+      label,
+      hits.length,
+    );
+    if (mode === 'lexical_only') {
+      q.metrics.increment(METRIC.retrievalResults, METRIC_HELP[METRIC.retrievalResults] ?? '', {
+        mode: 'lexical_fallback',
+      });
+    }
+    if (expansion) {
+      q.metrics.increment(
+        METRIC.thesaurusExpansions,
+        METRIC_HELP[METRIC.thesaurusExpansions] ?? '',
+        { kind: 'query' },
+        expansion.terms.length,
+      );
+    }
+  }
 
   return {
     hits,

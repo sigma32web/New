@@ -20,6 +20,7 @@
  * The gateway's interface is restated locally rather than imported, for the same reason `SharedBudget`
  * restates `BudgetLedger`: the dependency runs gateway → db, never the other way.
  */
+import { METRIC, METRIC_HELP, type Metrics } from '@yeonjae/domain';
 import { type Client, type Pool } from './client.js';
 import {
   acquireSlot,
@@ -108,8 +109,13 @@ export class PgProviderAdmission implements ProviderAdmission {
       /** Bounded: a caller must never block forever behind a saturated limit. */
       readonly maxWaitMs?: number | undefined;
       readonly sleep?: ((ms: number) => Promise<void>) | undefined;
+      readonly metrics?: Metrics | undefined;
     },
   ) {}
+
+  private count(name: string, labels: Readonly<Record<string, string>>): void {
+    this.opts.metrics?.increment(name, METRIC_HELP[name] ?? '', labels);
+  }
 
   private now(): Date {
     return (this.opts.clock ?? (() => new Date()))();
@@ -154,10 +160,17 @@ export class PgProviderAdmission implements ProviderAdmission {
     const releaseSlotOnce = async (): Promise<void> => {
       if (!slotHeld) return;
       slotHeld = false;
-      await releaseSlot(this.db, policy, {
+      const released = await releaseSlot(this.db, policy, {
         scopeKey,
         requestId: req.requestId,
         now: this.now(),
+      });
+      // `false` means the row was no longer live: the lease had already been reclaimed by its
+      // deadline while this caller still believed it held the slot. That is a real operational
+      // signal (a call outlived its lease) and it is the only place it is observable.
+      this.count(released ? METRIC.concurrencyAcquired : METRIC.leaseExpired, {
+        provider: req.provider,
+        ...(released ? { outcome: 'released' } : { reason: 'expired_before_release' }),
       });
     };
 
