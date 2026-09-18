@@ -11,6 +11,7 @@ export * from './leases.js';
 export * from './operator-resources.js';
 export * from './restore-safety.js';
 export * from './rate-limits.js';
+export * from './provider-admission.js';
 export * from './shared-budget.js';
 export * from './readiness.js';
 export * from './restore-drill.js';

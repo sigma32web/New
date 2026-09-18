@@ -50,9 +50,33 @@ export type RoutingTable = Readonly<Record<ModelClass, readonly RouteEntry[]>>;
 export interface BudgetLedger {
   /** Reserve `cents`; throw GatewayError('BUDGET_EXHAUSTED') when the scope cannot afford it. */
   reserve(
-    scope: { projectId: string; jobId: string },
+    scope: { projectId: string; jobId: string; workspaceId?: string | undefined },
     cents: number,
   ): Promise<{ release(actualCents: number): Promise<void> }>;
+}
+
+/**
+ * Rate admission in front of a paid attempt.
+ *
+ * Declared here as a structural interface, satisfied by `PgProviderAdmission` in `@yeonjae/db`, so the
+ * gateway depends on the SHAPE of shared enforcement and not on the database package. `grant.release()`
+ * frees the concurrency lease; the window count is deliberately not refundable.
+ */
+export interface ProviderAdmissionControl {
+  admit(req: {
+    workspaceId?: string | undefined;
+    provider: string;
+    modelId: string;
+    requestId: string;
+    tokens?: number | undefined;
+    signal?: AbortSignal | undefined;
+  }): Promise<{
+    readonly admitted: boolean;
+    readonly reason: string;
+    readonly retryAfterMs: number;
+    readonly waitedMs: number;
+    release(): Promise<void>;
+  }>;
 }
 
 export interface AuditRecord {
@@ -182,6 +206,11 @@ export interface GatewayOptions {
   readonly routing: RoutingTable;
   readonly budget: BudgetLedger;
   readonly audit: AuditStore;
+  /**
+   * Shared rate/concurrency admission. Optional in the TYPE so the many single-process test gateways
+   * stay valid, but the worker's production path supplies it and refuses to start without it.
+   */
+  readonly admission?: ProviderAdmissionControl | undefined;
   readonly guardContext?: GuardContext | undefined;
   /** Minimum English confidence for manuscript roles (policy.output_language.min_english_confidence). */
   readonly minEnglishConfidence?: number | undefined;
@@ -223,6 +252,20 @@ function costCents(route: RouteEntry, usage: ProviderResponse['usage']): number 
   return (
     (usage.input * route.priceInPerMTokCents + usage.output * route.priceOutPerMTokCents) /
     1_000_000
+  );
+}
+
+/**
+ * Is this error a budget refusal, whichever ledger raised it?
+ *
+ * Structural on `code` so both `GatewayError('BUDGET_EXHAUSTED')` and `@yeonjae/db`'s
+ * `BudgetExhaustedError` are recognized without a cross-package import.
+ */
+export function isBudgetExhausted(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { code?: unknown }).code === 'BUDGET_EXHAUSTED'
   );
 }
 
@@ -328,9 +371,23 @@ export class Gateway {
       cached: 0,
     });
     const reservation = await this.opts.budget
-      .reserve({ projectId: req.projectId, jobId: req.jobId }, predicted)
+      // The workspace ceiling is passed through so a shared ledger can enforce it; `MemoryBudget`
+      // ignores it, which is why the previous single-scope call site kept working.
+      .reserve(
+        { projectId: req.projectId, jobId: req.jobId, workspaceId: req.workspaceId },
+        predicted,
+      )
       .catch(async (err: unknown) => {
-        if (err instanceof GatewayError && err.code === 'BUDGET_EXHAUSTED') {
+        /**
+         * Recognize a budget refusal by its CODE, not by its class.
+         *
+         * `MemoryBudget` raises `GatewayError('BUDGET_EXHAUSTED')`, but the shared ledger lives in
+         * `@yeonjae/db` and raises its own `BudgetExhaustedError` carrying the same code — it cannot
+         * import this class without inverting the package dependency. Matching on the class alone meant
+         * a shared-budget refusal produced no `budget_blocked` audit row, which is the one durable
+         * record an operator needs to tell "refused by policy" from "crashed".
+         */
+        if (isBudgetExhausted(err)) {
           await this.opts.audit.append(
             this.record(
               req,
@@ -343,7 +400,10 @@ export class Gateway {
               'stop',
               false,
               0,
-              { class: 'BUDGET_EXHAUSTED', message: err.message },
+              {
+                class: 'BUDGET_EXHAUSTED',
+                message: err instanceof Error ? err.message : String(err),
+              },
             ),
           );
         }
@@ -414,6 +474,71 @@ export class Gateway {
           // same fact (no provider was contacted yet) stated in terms of the durable evidence.
           await settleCancelled(cancellationErrorOf(handle), route, attemptRecords.length === 0);
         attempt++;
+        /**
+         * SHARED RATE ADMISSION, immediately before the paid call and inside the attempt loop.
+         *
+         * Placing it here rather than once per `call()` is what makes retry, bounded repair and route
+         * fallback each require their OWN admission: all three are expressed as another iteration of
+         * this loop, so every provider attempt passes through exactly one admission decision. The
+         * request id carries the attempt number and the route, so a redelivered attempt re-reads its own
+         * decision (idempotent) while a genuine retry earns a fresh one.
+         */
+        let grant: Awaited<ReturnType<ProviderAdmissionControl['admit']>> | undefined;
+        if (this.opts.admission) {
+          grant = await this.opts.admission.admit({
+            workspaceId: req.workspaceId,
+            provider: route.provider,
+            modelId: route.modelId,
+            requestId: `${req.idempotencyKey}:${String(attempt)}:${route.modelId}`,
+            tokens: req.pack.tokenEstimate + params.max_tokens,
+            signal: handle.signal,
+          });
+          if (!grant.admitted) {
+            /**
+             * Refused. This is not a provider fault, so it must not be rerouted to a second paid model
+             * and must not be repaired — doing either would turn one refused call into more spend. The
+             * reservation is released at actual cost by the outer `catch`, and the audit row records the
+             * refusal with no usage, because no request was issued.
+             */
+            const rateError = new GatewayError(
+              'RATE_LIMITED',
+              `shared rate limit refused ${route.provider}/${route.modelId} (${grant.reason}); retry after ${String(grant.retryAfterMs)} ms`,
+            );
+            attemptRecords.push({
+              attempt,
+              model_id: route.modelId,
+              provider: route.provider,
+              outcome: 'failed',
+              failure_class: 'rate_limited',
+              error_class: 'RATE_LIMITED',
+              cost_cents: 0,
+              usage: { input: 0, output: 0, cached: 0 },
+              latency_ms: 0,
+            });
+            await this.opts.audit.append(
+              this.record(
+                req,
+                guard,
+                route,
+                params,
+                undefined,
+                actualCost,
+                'failed',
+                'error',
+                false,
+                repairAttempts,
+                { class: 'RATE_LIMITED', message: rateError.message },
+                fallbackFrom,
+                undefined,
+                undefined,
+                attempt,
+                attemptRecords,
+              ),
+            );
+            await reservation.release(actualCost);
+            throw rateError;
+          }
+        }
         let res: ProviderResponse;
         try {
           /**
@@ -498,6 +623,17 @@ export class Gateway {
           fallbackFrom = route.modelId;
           routeIdx++;
           continue;
+        } finally {
+          /**
+           * The concurrency lease covers the provider request and nothing more.
+           *
+           * Releasing in a `finally` on the attempt itself is what makes success, provider failure,
+           * timeout and cancellation all give the slot back — and `release()` is idempotent and safe
+           * after expiry, so a lease reclaimed by its deadline while this attempt was still running
+           * cannot be double-released. A process that dies here strands nothing permanently: the
+           * lease's own deadline reclaims it.
+           */
+          if (grant) await grant.release();
         }
         const attemptCost = costCents(route, res.usage);
         actualCost += attemptCost;
