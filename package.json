@@ -2,7 +2,7 @@
   "name": "yeonjae-studio",
   "version": "0.0.1",
   "private": true,
-  "description": "Yeonjae Studio — English manuscripts in the Korean serialized-webnovel tradition. Monorepo root.",
+  "description": "Yeonjae Studio \u2014 English manuscripts in the Korean serialized-webnovel tradition. Monorepo root.",
   "license": "UNLICENSED",
   "type": "module",
   "packageManager": "pnpm@10.26.0",
@@ -29,6 +29,7 @@
     "validate:contrast": "tsx packages/eval/src/main.ts",
     "generate:contrast-recordings": "tsx packages/eval/src/generate.ts",
     "cli": "tsx apps/cli/src/main.ts",
+    "synthetic:provider": "tsx tools/run-synthetic-provider.ts",
     "check": "pnpm run check:types-fresh && pnpm run typecheck && pnpm run lint && pnpm run format:check && pnpm run test && pnpm run test:replay-120 && pnpm run test:chaos && pnpm run drill:restore && pnpm run test:security && pnpm run test:costs && pnpm run build:web && pnpm run validate:planning && pnpm run validate:contrast",
     "build:web": "pnpm --filter @yeonjae/web build"
   },

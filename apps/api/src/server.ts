@@ -24,6 +24,7 @@ import {
   listCommits,
   manuscriptVersionsOf,
   needsAttention,
+  readiness,
   requestJobControl,
   revokeSession,
   timelinesOf,
@@ -293,20 +294,33 @@ export function buildApi(options: ApiOptions): FastifyInstance {
     reply.type('text/plain; version=0.0.4; charset=utf-8').send(metrics.render()),
   );
   app.get('/ready', async (_req, reply) => {
-    try {
-      await pool.query('SELECT 1');
-      return { status: 'ready' };
-    } catch {
-      // Never echo the database error: readiness is a boolean to a load balancer, not a diagnostic channel.
-      return reply.status(503).type(PROBLEM_CONTENT_TYPE).send({
-        type: 'urn:yeonjae:error:INTERNAL_ERROR',
-        title: 'Not ready',
-        status: 503,
-        detail: 'The database is not reachable.',
-        code: 'INTERNAL_ERROR',
-        request_id: _req.id,
-      });
+    /**
+     * Readiness is more than "the pool can reach a database".
+     *
+     * `SELECT 1` passes against a database that is behind on migrations, ahead of this build, carrying a
+     * tampered ledger, or whose application role has quietly been granted BYPASSRLS — and in every one
+     * of those states this instance must NOT take traffic, because the failure would otherwise surface
+     * as a broken request or, worse, as silently absent tenant isolation.
+     *
+     * The check list is returned so an operator can see WHICH dependency is unhappy. It carries no
+     * credential, no connection string and no tenant data (asserted in the db package's tests).
+     */
+    const report = await readiness(pool);
+    if (report.ready) {
+      return {
+        status: report.degraded ? 'degraded' : 'ready',
+        checks: report.checks,
+      };
     }
+    return reply.status(503).type(PROBLEM_CONTENT_TYPE).send({
+      type: 'urn:yeonjae:error:INTERNAL_ERROR',
+      title: 'Not ready',
+      status: 503,
+      detail: 'One or more readiness checks failed.',
+      code: 'INTERNAL_ERROR',
+      request_id: _req.id,
+      checks: report.checks,
+    });
   });
 
   // ---- authentication -------------------------------------------------------------------------------
@@ -1211,6 +1225,13 @@ export function buildApi(options: ApiOptions): FastifyInstance {
             requestId: req.id,
             detail: { applied: result.applied, reason: result.reason ?? null },
           });
+          // Counted with the same truthfulness the response carries: a refused control is an
+          // `applied=false` outcome, not an absence of signal.
+          metrics.increment(METRIC.jobControl, METRIC_HELP[METRIC.jobControl] ?? '', {
+            // `action` is validated against a closed list above, so it is already bounded.
+            control: action,
+            outcome: result.applied ? 'applied' : 'refused',
+          });
           return {
             // A refused request is reported truthfully rather than as a silent success: the client is
             // told the job is terminal / not paused / already requested, and can act on it.
@@ -1246,6 +1267,7 @@ export function buildApi(options: ApiOptions): FastifyInstance {
     // foreign job produces a normal problem document instead of a half-open event stream.
     await inScope(pool, scope, async (c) => jobRowOr404(c, jobId));
 
+    metrics.increment(METRIC.sseConnections, METRIC_HELP[METRIC.sseConnections] ?? '');
     reply.raw.writeHead(200, { ...SSE_HEADERS, 'x-request-id': req.id });
     const sink: SseSink = {
       write: (chunk) => {
@@ -1264,6 +1286,16 @@ export function buildApi(options: ApiOptions): FastifyInstance {
         inScope(pool, scope, async (c) => jobEventsAfter(c, { jobId, afterSeq, limit })),
     });
     if (!sink.isClosed()) reply.raw.end();
+    // `parseLastEventId` returns 0 when the client sent no cursor, so a REPLAY is `fromSeq > 0` --
+    // an undefined check is always true here and would count every fresh stream as a replay.
+    if (fromSeq > 0) {
+      metrics.increment(
+        METRIC.sseReplays,
+        METRIC_HELP[METRIC.sseReplays] ?? '',
+        {},
+        result.delivered,
+      );
+    }
     req.log.debug({ request_id: req.id, ...result }, 'sse stream finished');
     return reply;
   });
@@ -1372,8 +1404,16 @@ export function buildApi(options: ApiOptions): FastifyInstance {
                 detail: { format, status: 'failed', code: wf.code ?? 'INTERNAL' },
               });
             });
+            metrics.increment(METRIC.exports, METRIC_HELP[METRIC.exports] ?? '', {
+              format,
+              status: 'failed',
+            });
             throw err;
           }
+          metrics.increment(METRIC.exports, METRIC_HELP[METRIC.exports] ?? '', {
+            format,
+            status: 'ready',
+          });
           const row = await persistExport(c, {
             workspaceId: scope.workspaceId,
             projectId,
