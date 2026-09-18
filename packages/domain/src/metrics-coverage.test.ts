@@ -67,7 +67,6 @@ const NOT_YET_EMITTED: Readonly<Record<string, string>> = {
   // Requires Temporal task-queue introspection, which the local workflow mode does not expose.
   [METRIC.queueDepth]: 'needs Temporal task-queue introspection; not available in local mode',
   [METRIC.activityAttempts]: 'needs Temporal activity interceptors; local mode runs steps directly',
-  [METRIC.workflowStates]: 'needs Temporal workflow interceptors; local mode runs steps directly',
   // The pool does not surface a saturation event; measuring it needs a pg-pool wrapper.
   [METRIC.dbPoolSaturation]: 'pg-pool exposes no saturation event to hook',
   // Fencing lives in the SQL assertion, which raises rather than returning a countable outcome.
